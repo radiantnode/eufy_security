@@ -92,6 +92,26 @@ def wakes(root: str, serial: str) -> list[str]:
     return [os.path.join(base, n) for n in names]
 
 
+def spread(items: list, most: int) -> list:
+    """At most `most` of `items`, evenly spread, keeping the first and last."""
+    if len(items) <= most:
+        return items
+    if most == 1:
+        return items[:1]
+    step = (len(items) - 1) / (most - 1)
+    return [items[round(i * step)] for i in range(most)]
+
+
+def wake_times(root: str, serial: str, since: float) -> list[str]:
+    """When every wake after `since` (epoch seconds) was, newest first, read
+    off the folder names alone. A look back thinned to `most` pictures still
+    needs these to say where nothing was kept."""
+    return [
+        datetime.fromtimestamp(wake_time(f), timezone.utc).isoformat()
+        for f in wakes(root, serial) if wake_time(f) >= since
+    ]
+
+
 def resized(data: bytes, width: int) -> bytes:
     """A JPEG no wider than `width`, as JPEG."""
     from PIL import Image  # noqa: PLC0415 — Home Assistant ships Pillow; only needed here
@@ -106,14 +126,19 @@ def resized(data: bytes, width: int) -> bytes:
 
 
 def load_wakes(root: str, serial: str, count: int, width: int, per_wake: int | None = None,
-               since: float | None = None) -> list[dict]:
+               since: float | None = None, most: int | None = None) -> list[dict]:
     """The newest `count` wakes as the service answers them, or every wake
     after `since` (epoch seconds): when, and each frame as base64 JPEG with
     its offset in seconds. `per_wake` keeps only that many frames from each,
-    taken from the middle of the burst."""
+    taken from the middle of the burst. `most` thins them to that many, evenly
+    spread and keeping the newest and oldest, before any picture is read:
+    twenty minutes can be 120 wakes, each a decode and a resize, and whoever
+    asked was only going to keep a couple of dozen."""
     out = []
     folders = wakes(root, serial)
     folders = [f for f in folders if wake_time(f) >= since] if since is not None else folders[:count]
+    if most:
+        folders = spread(folders, most)
     for folder in folders:
         try:
             with open(os.path.join(folder, "wake.json"), encoding="utf-8") as f:

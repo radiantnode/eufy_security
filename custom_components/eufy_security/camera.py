@@ -42,6 +42,11 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 #: stop and a start asked for by a service waits on it. One HomeBase here.
 _STATION_LOCK = asyncio.Lock()
 
+#: Hubble fork: when a service last stopped a stream (someone's look ending),
+#: on the monotonic clock. The sampler leaves COOLDOWN_S after it, as it does
+#: after its own stop.
+_stopped = {"at": 0.0}
+
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     """Setup camera entities."""
@@ -113,7 +118,22 @@ async def _sample_forever(hass: HomeAssistant, cameras: list) -> None:
                 # that failed upstream could leave a camera PREPARING for good.
                 if any(c.product.is_streaming for c in cameras):
                     continue
-                if await due._sample():
+                # A look that has only just stopped gets the same breath the
+                # sampler gives itself: a start straight after any stop is
+                # what the HomeBase refuses, whoever did the stopping.
+                if time.monotonic() - _stopped["at"] < wake_frames.COOLDOWN_S:
+                    continue
+                try:
+                    kept = await due._sample()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    # Anything a sample raises costs it its turn like a
+                    # sample with no frame. Left to the handler below, the
+                    # same camera was tried again every tick, for good.
+                    _LOGGER.warning(f"sampler - sampling {due.product.name} failed", exc_info=True)
+                    kept = False
+                if kept:
                     last[str(due.product.serial_no)] = time.time()
                 else:
                     _LOGGER.warning(f"sampler - {due.product.name} didn't give a frame; trying the other first")
@@ -250,7 +270,14 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
         stream started without Home Assistant's own stream worker, the frame
         taken from go2rtc, and the stream always stopped again."""
         woken = time.time()
-        if await self.product.start_livestream() is False:
+        try:
+            started = await self.product.start_livestream()
+        except Exception as ex:  # pylint: disable=broad-except
+            # The add-on refused the start or isn't answering: it raises
+            # rather than answering False. One line, and no frame this time.
+            _LOGGER.warning(f"sampler - {self.product.name} couldn't be started: {ex!r}")
+            started = False
+        if started is False:
             with contextlib.suppress(Exception):
                 await self.product.stop_livestream()
             return False
@@ -341,22 +368,31 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
         _LOGGER.debug(f"_capture_burst - kept {len(taken)} frames")
 
     async def _get_frames(self, wakes: int = 1, frames: int = 0, width: int = 960, wait: bool = True,
-                          minutes: int = 0) -> dict:
+                          minutes: int = 0, most: int = 0) -> dict:
         """Hubble fork: the frames kept from the last `wakes` wakes, or from
-        every wake in the last `minutes`."""
+        every wake in the last `minutes`; at most `most` of them, evenly
+        spread. With `minutes` the answer also carries `times`: when every
+        wake in the window was, the ones `most` left out included."""
         if wait and self._burst is not None and not self._burst.done():
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(self._burst), wake_frames.BURST_TIMEOUT_S)
+        root, serial = self.hass.config.path(), str(self.product.serial_no)
+        since = time.time() - minutes * 60 if minutes else None
         kept = await self.hass.async_add_executor_job(
-            wake_frames.load_wakes, self.hass.config.path(), str(self.product.serial_no), wakes, width, frames or None,
-            time.time() - minutes * 60 if minutes else None,
+            wake_frames.load_wakes, root, serial, wakes, width, frames or None, since, most or None
         )
-        return {"wakes": kept}
+        answer = {"wakes": kept}
+        if since is not None:
+            answer["times"] = await self.hass.async_add_executor_job(wake_frames.wake_times, root, serial, since)
+        return answer
 
     async def _stop_livestream(self) -> None:
         """stop byte based livestream on camera"""
         await self._stop_hass_streaming()
-        await self.product.stop_livestream()
+        try:
+            await self.product.stop_livestream()
+        finally:
+            _stopped["at"] = time.monotonic()  # Hubble fork: the sampler's cooldown
         self.async_write_ha_state()
 
     async def _start_rtsp_livestream(self) -> None:

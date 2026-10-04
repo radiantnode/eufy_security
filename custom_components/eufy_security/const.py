@@ -53,6 +53,7 @@ class Schema(Enum):
             vol.Optional("width", default=960): vol.All(vol.Coerce(int), vol.Range(min=160, max=1920)),
             vol.Optional("wait", default=True): cv.boolean,
             vol.Optional("minutes", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=60)),
+            vol.Optional("most", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=120)),
         }
     )
     SNOOZE = make_entity_service_schema(

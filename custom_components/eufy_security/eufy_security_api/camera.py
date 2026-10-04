@@ -115,18 +115,25 @@ class Camera(Device):
         self.stream_debug = "info - send command to add-on"
         _LOGGER.debug(f"_initiate_start_stream - {self.stream_debug} - {stream_type}")
         event = None
-        if stream_type == StreamProvider.P2P:
-            event = self.p2p_started_event
-            event.clear()
-            if await self.api.start_livestream(self.product_type, self.serial_no) is False:
-                self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
-                return False
-        else:
-            event = self.rtsp_started_event
-            event.clear()
-            if await self.api.start_rtsp_livestream(self.product_type, self.serial_no) is False:
-                self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
-                return False
+        try:
+            if stream_type == StreamProvider.P2P:
+                event = self.p2p_started_event
+                event.clear()
+                if await self.api.start_livestream(self.product_type, self.serial_no) is False:
+                    self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
+                    return False
+            else:
+                event = self.rtsp_started_event
+                event.clear()
+                if await self.api.start_rtsp_livestream(self.product_type, self.serial_no) is False:
+                    self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
+                    return False
+        except Exception:
+            # Hubble fork: a start the add-on refuses is raised, never answered
+            # False (it's restarting, or says a stream is already running), and
+            # that isn't still preparing either. See below.
+            self.stream_status = StreamStatus.IDLE
+            raise
 
         try:
             await asyncio.wait_for(event.wait(), STREAM_TIMEOUT_SECONDS)
@@ -142,25 +149,50 @@ class Camera(Device):
             self.stream_status = StreamStatus.IDLE
             return False
 
-    async def _check_live_stream(self):
-        while self.p2p_streamer.retry is None:
+    async def _check_live_stream(self, streamer: P2PStreamer):
+        # Hubble fork: watches the streamer of the stream it was started for,
+        # not whichever one the camera holds by now. See start_livestream.
+        while streamer.retry is None:
             await asyncio.sleep(0.5)
 
-        _LOGGER.debug(f"async_restart_livestream - start - {self.p2p_streamer.retry}")
+        # Hubble fork: a newer stream has taken this one's place and has a
+        # checker of its own. It isn't this one's to stop or restart.
+        if self.p2p_streamer is not streamer:
+            return
+
+        _LOGGER.debug(f"async_restart_livestream - start - {streamer.retry}")
         if self.stream_status != StreamStatus.IDLE:
             await self.stop_livestream(is_internal=True)
 
-        if self.p2p_streamer.retry is True:
-            _LOGGER.debug(f"async_restart_livestream - start live stream start - {self.p2p_streamer.retry}")
+        if streamer.retry is True:
+            _LOGGER.debug(f"async_restart_livestream - start live stream start - {streamer.retry}")
             await self.start_livestream()
-            _LOGGER.debug(f"async_restart_livestream - start live stream end - {self.p2p_streamer.retry}")
+            _LOGGER.debug(f"async_restart_livestream - start live stream end - {streamer.retry}")
 
     async def start_livestream(self) -> bool:
         """Process start p2p livestream call"""
+        # Hubble fork: a streamer of its own for every stream. A stream's
+        # writer thread outlives its stop by STREAM_TIMEOUT_SECONDS and then
+        # sets `retry` to True (go2rtc answers the ended post with a 500, and
+        # `False or True` is True). On the one shared streamer the next
+        # stream's checker read that as its own and stopped and restarted a
+        # stream someone was looking through: on 2026-10-04 a look ten seconds
+        # after a sample lost its burst and took 15.7s. With the sampler a
+        # stream ends every thirty seconds, so that overlap was routine.
+        streamer = self.p2p_streamer = P2PStreamer(self)
         if await self._initiate_start_stream(StreamProvider.P2P) is False:
             return False
-        self.stream_future = asyncio.create_task(self.p2p_streamer.start())
-        self.stream_checker = asyncio.create_task(self._check_live_stream())
+        if streamer.retry is False:
+            # Hubble fork: stopped while it was still starting (a look cut
+            # off). That stop went out before there was a stream to stop, so
+            # this one came up with nobody left to stop it, and the sampler
+            # stands aside for as long as any camera is streaming.
+            with contextlib.suppress(Exception):
+                await self.api.stop_livestream(self.product_type, self.serial_no)
+            self.stream_status = StreamStatus.IDLE
+            return False
+        self.stream_future = asyncio.create_task(streamer.start())
+        self.stream_checker = asyncio.create_task(self._check_live_stream(streamer))
         self.stream_status = StreamStatus.STREAMING
         return True
 

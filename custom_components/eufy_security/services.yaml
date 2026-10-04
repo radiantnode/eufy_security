@@ -425,3 +425,14 @@ get_frames:
         number:
           min: 0
           max: 60
+    most:
+      name: Most
+      description: >-
+        At most this many wakes, evenly spread and keeping the newest and
+        oldest (0 for all of them). With minutes, the answer also lists the
+        time of every wake in the window, including the ones left out.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 120
