@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import traceback
+
+import aiohttp
 
 from haffmpeg.camera import CameraMjpeg
 from haffmpeg.tools import ImageFrame
@@ -12,7 +15,7 @@ from homeassistant.components import ffmpeg
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.ffmpeg import DATA_FFMPEG
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream, async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -26,6 +29,7 @@ from .eufy_security_api.camera import (
     StreamProvider,
     StreamStatus,
 )
+from .eufy_security_api import frames as wake_frames
 from .eufy_security_api.const import GO2RTC_API_PORT
 from .eufy_security_api.metadata import Metadata
 from .eufy_security_api.util import wait_for_value_to_equal
@@ -66,6 +70,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     platform.async_register_entity_service("reset_alarm", {}, "_async_reset_alarm")
     platform.async_register_entity_service("quick_response", Schema.QUICK_RESPONSE_SERVICE_SCHEMA.value, "_async_quick_response")
     platform.async_register_entity_service("snooze", Schema.SNOOZE.value, "_snooze")
+    # Hubble fork: the frames kept from each wake. See eufy_security_api/frames.py.
+    platform.async_register_entity_service(
+        "get_frames", Schema.GET_FRAMES_SERVICE_SCHEMA.value, "_get_frames", supports_response=SupportsResponse.ONLY
+    )
 
 
 class EufySecurityCamera(Camera, EufySecurityEntity):
@@ -85,6 +93,9 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
 
         # ffmpeg entities
         self.ffmpeg = self.coordinator.hass.data[DATA_FFMPEG]
+
+        # Hubble fork: the burst being taken from this wake, if one is.
+        self._burst: asyncio.Task | None = None
 
     async def stream_source(self) -> str:
         if self.is_streaming is False:
@@ -189,7 +200,75 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
             await self._stop_livestream()
         else:
             await self._start_hass_streaming()
+            # Hubble fork: keep a burst from every wake, whoever woke it.
+            if self._burst is None or self._burst.done():
+                self._burst = self.hass.async_create_background_task(
+                    self._capture_burst(time.time()), f"eufy_security burst {self.product.serial_no}"
+                )
         self.async_write_ha_state()
+
+    async def _capture_burst(self, woken: float) -> None:
+        """Hubble fork: a few frames from go2rtc's MJPEG of this stream,
+        BURST_GAP_S apart, saved with when the camera was woken. Ends early if
+        the stream stops."""
+        api = f"http://{self.coordinator.config.rtsp_server_address}:{GO2RTC_API_PORT}/api"
+        serial = str(self.product.serial_no)
+        burst = f"{serial}_burst"
+        # go2rtc only serves MJPEG from a source that makes it, so a second
+        # stream transcodes this one; ffmpeg runs only while it's being read.
+        # go2rtc keeps an API-made stream in memory and answers 400 when it
+        # can't also write it to its config file, as for the integration's own.
+        with contextlib.suppress(asyncio.TimeoutError, aiohttp.ClientError):
+            async with async_get_clientsession(self.hass).put(
+                f"{api}/streams", params={"name": burst, "src": f"ffmpeg:{serial}#video=mjpeg"}, timeout=5
+            ):
+                pass
+        url = f"{api}/stream.mjpeg"
+        taken: list[tuple[float, bytes]] = []
+        first = None
+        deadline = time.monotonic() + wake_frames.BURST_TIMEOUT_S
+        # The stream is up before its video reaches go2rtc, and go2rtc answers
+        # a source with no media yet with an empty stream that ends at once.
+        # So ask again until frames come, or the time's up, or it stopped.
+        while len(taken) < wake_frames.BURST_FRAMES and time.monotonic() < deadline and self.is_streaming:
+            try:
+                async with async_get_clientsession(self.hass).get(
+                    url,
+                    params={"src": burst},
+                    timeout=aiohttp.ClientTimeout(total=max(1.0, deadline - time.monotonic())),
+                ) as response:
+                    buffer = b""
+                    async for chunk in response.content.iter_any():
+                        buffer += chunk
+                        while True:
+                            frame, buffer = wake_frames.next_jpeg(buffer)
+                            if frame is None:
+                                break
+                            now = time.monotonic()
+                            if first is None or now - first >= len(taken) * wake_frames.BURST_GAP_S:
+                                first = first if first is not None else now
+                                taken.append((round(now - first, 2), frame))
+                        if len(taken) >= wake_frames.BURST_FRAMES:
+                            break
+            except (asyncio.TimeoutError, aiohttp.ClientError) as ex:
+                _LOGGER.debug(f"_capture_burst - {ex}")
+            if len(taken) < wake_frames.BURST_FRAMES:
+                await asyncio.sleep(0.25)
+        if taken:
+            await self.hass.async_add_executor_job(
+                wake_frames.save_wake, self.hass.config.path(), str(self.product.serial_no), woken, taken
+            )
+        _LOGGER.debug(f"_capture_burst - kept {len(taken)} frames")
+
+    async def _get_frames(self, wakes: int = 1, frames: int = 0, width: int = 960, wait: bool = True) -> dict:
+        """Hubble fork: the frames kept from the last `wakes` wakes."""
+        if wait and self._burst is not None and not self._burst.done():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(self._burst), wake_frames.BURST_TIMEOUT_S)
+        kept = await self.hass.async_add_executor_job(
+            wake_frames.load_wakes, self.hass.config.path(), str(self.product.serial_no), wakes, width, frames or None
+        )
+        return {"wakes": kept}
 
     async def _stop_livestream(self) -> None:
         """stop byte based livestream on camera"""

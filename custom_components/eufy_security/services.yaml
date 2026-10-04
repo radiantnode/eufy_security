@@ -376,3 +376,44 @@ snooze:
       default: False
       selector:
         boolean:
+
+get_frames:
+  name: Get Frames
+  description: >-
+    Frames saved from the last times this camera's live stream started: a short
+    burst each, with the time. Answers with them as base64 JPEG.
+  target:
+    entity:
+      integration: eufy_security
+      domain: camera
+  fields:
+    wakes:
+      name: Wakes
+      description: How many of the most recent wakes, newest first (1-5).
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 5
+    frames:
+      name: Frames per wake
+      description: Frames from each wake, from the middle of its burst. 0 for all of them.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 5
+    width:
+      name: Width
+      description: Widest a frame comes back, in pixels.
+      default: 960
+      selector:
+        number:
+          min: 160
+          max: 1920
+    wait:
+      name: Wait
+      description: If a burst is being taken right now, wait for it.
+      default: true
+      selector:
+        boolean:
