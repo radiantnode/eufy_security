@@ -119,11 +119,13 @@ class Camera(Device):
             event = self.p2p_started_event
             event.clear()
             if await self.api.start_livestream(self.product_type, self.serial_no) is False:
+                self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
                 return False
         else:
             event = self.rtsp_started_event
             event.clear()
             if await self.api.start_rtsp_livestream(self.product_type, self.serial_no) is False:
+                self.stream_status = StreamStatus.IDLE  # Hubble fork: see below
                 return False
 
         try:
@@ -134,6 +136,10 @@ class Camera(Device):
         except asyncio.TimeoutError:
             self.stream_debug = f"error - command was failed - {event}"
             _LOGGER.debug(f"_initiate_start_stream - {self.stream_debug}")
+            # Hubble fork: a start that never came isn't still preparing. Left
+            # PREPARING, the camera read as busy until Home Assistant restarted
+            # (2026-10-04: the minute sampler stood aside for good).
+            self.stream_status = StreamStatus.IDLE
             return False
 
     async def _check_live_stream(self):

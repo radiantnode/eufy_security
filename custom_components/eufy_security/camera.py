@@ -109,10 +109,17 @@ async def _sample_forever(hass: HomeAssistant, cameras: list) -> None:
             if time.time() - last.get(str(due.product.serial_no), 0.0) < wake_frames.SAMPLE_EVERY_S:
                 continue
             async with _STATION_LOCK:
-                if any(c.product.stream_status != StreamStatus.IDLE for c in cameras):
+                # Streaming means someone's looking. Not "not idle": a start
+                # that failed upstream could leave a camera PREPARING for good.
+                if any(c.product.is_streaming for c in cameras):
                     continue
                 if await due._sample():
                     last[str(due.product.serial_no)] = time.time()
+                else:
+                    _LOGGER.warning(f"sampler - {due.product.name} didn't give a frame; trying the other first")
+                    # Its turn passes, so one camera that won't start doesn't
+                    # starve the other.
+                    last[str(due.product.serial_no)] = time.time() - wake_frames.SAMPLE_EVERY_S / 2
                 await asyncio.sleep(wake_frames.COOLDOWN_S)
         except asyncio.CancelledError:
             raise
