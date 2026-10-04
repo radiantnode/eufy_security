@@ -14,7 +14,7 @@ from homeassistant.components.ffmpeg import DATA_FFMPEG
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_platform
-from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream
+from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream, async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import COORDINATOR, DOMAIN, Schema
@@ -26,6 +26,7 @@ from .eufy_security_api.camera import (
     StreamProvider,
     StreamStatus,
 )
+from .eufy_security_api.const import GO2RTC_API_PORT
 from .eufy_security_api.metadata import Metadata
 from .eufy_security_api.util import wait_for_value_to_equal
 
@@ -118,7 +119,10 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
         await self.async_create_stream()
         if self.stream is not None:
             await self.stream.start()
-        await self.async_camera_image()
+        # Hubble patch 2026-10-04: no picture grabbed here. It made every
+        # start_p2p_livestream wait ~3.5s on ffmpeg and a keyframe before
+        # returning, and whoever started the stream asks for a picture next
+        # anyway. Was: await self.async_camera_image()
 
     async def _stop_hass_streaming(self):
         if self.stream is not None:
@@ -147,9 +151,29 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
             _LOGGER.debug(f"_get_image_from_stream_url - is_empty {result is None}")
             await asyncio.sleep(STREAM_SLEEP_SECONDS)
 
+    async def _get_image_from_go2rtc(self) -> bytes | None:
+        """Hubble patch 2026-10-04: a P2P stream is already decoded by go2rtc,
+        which hands out a frame in 1-2s; ffmpeg reopening the RTSP copy took
+        3-4s every time. None when it can't, and the caller falls back."""
+        if self.product.stream_provider != StreamProvider.P2P:
+            return None
+        url = f"http://{self.coordinator.config.rtsp_server_address}:{GO2RTC_API_PORT}/api/frame.jpeg"
+        try:
+            async with async_get_clientsession(self.hass).get(
+                url, params={"src": str(self.product.serial_no)}, timeout=STREAM_TIMEOUT_SECONDS
+            ) as response:
+                if response.status == 200 and response.content_type == "image/jpeg":
+                    return await response.read()
+        except Exception as ex:  # pylint: disable=broad-except
+            _LOGGER.debug(f"_get_image_from_go2rtc - {ex}")
+        return None
+
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         _LOGGER.debug(f"image 1 - {self.is_streaming} - {self.stream}")
         if self.is_streaming is True:
+            if (image := await self._get_image_from_go2rtc()) is not None:
+                self._last_image = image
+                return image
             with contextlib.suppress(asyncio.TimeoutError):
                 self._last_image = await asyncio.wait_for(self._get_image_from_stream_url(width, height), STREAM_TIMEOUT_SECONDS)
             _LOGGER.debug(f"image 2 - is_empty {self._last_image is None}")
