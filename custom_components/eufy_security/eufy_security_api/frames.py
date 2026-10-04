@@ -22,8 +22,19 @@ BURST_FRAMES = 5
 BURST_GAP_S = 0.5
 #: Longest a burst may take, from the stream starting.
 BURST_TIMEOUT_S = 12
-#: Wakes kept per camera.
-WAKES_KEPT = 5
+#: How far back wakes are kept, and the most kept whatever their age. The
+#: newest is always kept, however old, so a camera that hasn't been seen in a
+#: while still has a last picture.
+KEEP_S = 20 * 60
+WAKES_MOST = 120
+#: Each camera is woken on its own this often, for one frame, so the last
+#: KEEP_S reads as a picture a minute. A look by anyone counts as a wake.
+SAMPLE_EVERY_S = 60
+#: How often the sampler checks whose turn it is.
+SAMPLER_TICK_S = 5
+#: Left between a sample's stop and the next start: a start straight after a
+#: stop is what the HomeBase refused on 2026-10-04.
+COOLDOWN_S = 3
 #: Where they're kept, under Home Assistant's config folder.
 FRAMES_DIR = "eufy_security_frames"
 
@@ -61,9 +72,15 @@ def save_wake(root: str, serial: str, woken: float, frames: list[tuple[float, by
     }
     with open(os.path.join(folder, "wake.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
-    for old in wakes(root, serial)[WAKES_KEPT:]:
-        shutil.rmtree(old, ignore_errors=True)
+    for i, old in enumerate(wakes(root, serial)):
+        if i and (i >= WAKES_MOST or woken - wake_time(old) > KEEP_S):
+            shutil.rmtree(old, ignore_errors=True)
     return folder
+
+
+def wake_time(folder: str) -> float:
+    """When a wake was, from its folder's name (milliseconds)."""
+    return int(os.path.basename(folder)) / 1000
 
 
 def wakes(root: str, serial: str) -> list[str]:
@@ -88,12 +105,16 @@ def resized(data: bytes, width: int) -> bytes:
     return out.getvalue()
 
 
-def load_wakes(root: str, serial: str, count: int, width: int, per_wake: int | None = None) -> list[dict]:
-    """The newest `count` wakes as the service answers them: when, and each
-    frame as base64 JPEG with its offset in seconds. `per_wake` keeps only
-    that many frames from each, taken from the middle of the burst."""
+def load_wakes(root: str, serial: str, count: int, width: int, per_wake: int | None = None,
+               since: float | None = None) -> list[dict]:
+    """The newest `count` wakes as the service answers them, or every wake
+    after `since` (epoch seconds): when, and each frame as base64 JPEG with
+    its offset in seconds. `per_wake` keeps only that many frames from each,
+    taken from the middle of the burst."""
     out = []
-    for folder in wakes(root, serial)[:count]:
+    folders = wakes(root, serial)
+    folders = [f for f in folders if wake_time(f) >= since] if since is not None else folders[:count]
+    for folder in folders:
         try:
             with open(os.path.join(folder, "wake.json"), encoding="utf-8") as f:
                 meta = json.load(f)

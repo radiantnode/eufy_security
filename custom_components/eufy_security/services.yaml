@@ -389,12 +389,12 @@ get_frames:
   fields:
     wakes:
       name: Wakes
-      description: How many of the most recent wakes, newest first (1-5).
+      description: How many of the most recent wakes, newest first.
       default: 1
       selector:
         number:
           min: 1
-          max: 5
+          max: 120
     frames:
       name: Frames per wake
       description: Frames from each wake, from the middle of its burst. 0 for all of them.
@@ -417,3 +417,11 @@ get_frames:
       default: true
       selector:
         boolean:
+    minutes:
+      name: Minutes
+      description: Every wake in the last this many minutes instead, newest first (0 for by count).
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60

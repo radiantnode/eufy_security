@@ -48,10 +48,11 @@ class Schema(Enum):
     CHIME_SERVICE_SCHEMA = make_entity_service_schema({vol.Required("ringtone"): cv.Number})
     GET_FRAMES_SERVICE_SCHEMA = make_entity_service_schema(
         {
-            vol.Optional("wakes", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=5)),
+            vol.Optional("wakes", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=120)),
             vol.Optional("frames", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=5)),
             vol.Optional("width", default=960): vol.All(vol.Coerce(int), vol.Range(min=160, max=1920)),
             vol.Optional("wait", default=True): cv.boolean,
+            vol.Optional("minutes", default=0): vol.All(vol.Coerce(int), vol.Range(min=0, max=60)),
         }
     )
     SNOOZE = make_entity_service_schema(
